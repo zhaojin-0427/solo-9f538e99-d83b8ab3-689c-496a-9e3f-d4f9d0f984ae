@@ -1,0 +1,24 @@
+services:
+  moisture-api:
+    build: .
+    image: moisture-api:local
+    container_name: moisture-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # 下载租约保留时长（秒），仅用于防御性清理
+      LEASE_TTL_SECONDS: "3600"
+      MAX_UPLOAD_BYTES: "67108864"
+    volumes:
+      - moisture-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+
+volumes:
+  moisture-data:
