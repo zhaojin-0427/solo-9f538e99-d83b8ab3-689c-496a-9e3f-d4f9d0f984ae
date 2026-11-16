@@ -79,12 +79,30 @@ CREATE TABLE IF NOT EXISTS gc_queue (
     last_error  TEXT
 );
 
+-- 快照用量账本：按（快照, 分区）长期保留，独立于 snapshot_entries。
+-- 快照释放或 blob 原件被回收时，snapshot_entries 可能被删除，但这里的历史
+-- 统计必须仍可查询；因此只对 snapshots 建外键，不对 blobs/snapshot_entries
+-- 建外键。每次“完整发送”只用一个原子 UPDATE 记账，失败整体回滚。
+CREATE TABLE IF NOT EXISTS snapshot_usage (
+    snapshot_id         INTEGER NOT NULL,
+    partition_id        TEXT NOT NULL,
+    blob_sha            TEXT NOT NULL,
+    size_bytes          INTEGER NOT NULL DEFAULT 0,
+    completed_downloads INTEGER NOT NULL DEFAULT 0,
+    total_bytes         INTEGER NOT NULL DEFAULT 0,
+    last_completed_at   TEXT,
+    PRIMARY KEY (snapshot_id, partition_id),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_partition_entries_blob
     ON partition_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_snapshot_entries_blob
     ON snapshot_entries(blob_sha);
 CREATE INDEX IF NOT EXISTS idx_leases_blob
     ON download_leases(blob_sha);
+CREATE INDEX IF NOT EXISTS idx_snapshot_usage_snapshot
+    ON snapshot_usage(snapshot_id);
 """
 
 
@@ -109,19 +127,33 @@ def init_db(cfg: Settings = default_settings) -> None:
 
     租约只在本进程的流式响应期间有效；进程重启意味着没有任何下载还活着，
     旧租约一律作废，恢复后相关文件即可被正常回收。
+
+    同时为历史快照补建用量账本行（只补零值，不猜测未完成下载）：
+    账本是新增能力，升级前已创建的快照没有账本行，这里从仍存在的
+    ``snapshot_entries`` 补出分区清单；补行幂等且不会改动已提交计数。
     """
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
     cfg.blobs_dir.mkdir(parents=True, exist_ok=True)
     cfg.tmp_dir.mkdir(parents=True, exist_ok=True)
     conn = connect(cfg)
     try:
-        conn.execute("BEGIN IMMEDIATE;")
+        # executescript 会先隐式 COMMIT，因此 DDL 之后再开真正的写事务
         conn.executescript(SCHEMA)
-        conn.execute("DELETE FROM download_leases;")
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO snapshot_usage(snapshot_id, partition_id, blob_sha, size_bytes)
+                SELECT se.snapshot_id, se.partition_id, se.blob_sha,
+                       COALESCE((SELECT b.size FROM blobs b WHERE b.sha256 = se.blob_sha), 0)
+                  FROM snapshot_entries se
+                """
+            )
+            conn.execute("DELETE FROM download_leases;")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
     finally:
         conn.close()
 

@@ -32,10 +32,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="土壤湿度分区内容寻址存储 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "按日期分区上传 CSV（站点、湿度），整份替换当前分区；"
-        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放与安全回收。"
+        "相同字节按 SHA-256 共用数据卷文件；支持快照固定/释放、安全回收，"
+        "以及按快照逐分区的用量统计（完整发送次数/累计字节/最近完成时间）。"
     ),
     lifespan=lifespan,
 )
@@ -105,9 +106,11 @@ def download_partition(
 
     下载开始即取得租约，流式传输期间不持元数据锁，慢下载不阻塞
     上传/释放/其他文件回收，且本文件在下载结束前不会被回收。
+    带 snapshot_id 的下载在**文件流正常读到末尾**后为快照用量计一次；
+    首块前或中途断开不计，并发下载分别计数。
     """
     try:
-        sha, path, cleanup = service.open_partition_download(partition_id, snapshot_id)
+        ticket = service.open_partition_download(partition_id, snapshot_id)
     except NotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except SnapshotReleased as exc:
@@ -115,11 +118,12 @@ def download_partition(
     except MissingBlobFile as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    stream = service.stream_blob(path, cleanup)
+    stream = service.stream_blob(ticket.path, ticket)
     filename = f"{partition_id}.csv"
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
-        "X-Blob-SHA256": sha,
+        "X-Blob-SHA256": ticket.sha,
+        "Content-Length": str(ticket.size),
     }
     if snapshot_id is not None:
         headers["X-Snapshot-ID"] = str(snapshot_id)
@@ -138,6 +142,19 @@ def create_snapshot():
 @app.get("/snapshots")
 def list_snapshots():
     return {"snapshots": service.list_snapshots()}
+
+
+@app.get("/snapshots/{snapshot_id}/usage")
+def get_snapshot_usage(snapshot_id: int):
+    """查询快照用量：逐分区列出固定时的 SHA-256、完整发送次数、累计字节和最近完成时间。
+
+    从未下载的分区也会列出（次数/字节为 0，最近完成时间为 null）。
+    快照释放、原件被回收后仍可查询历史用量。
+    """
+    try:
+        return service.get_snapshot_usage(snapshot_id)
+    except NotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @app.post("/snapshots/{snapshot_id}/release")

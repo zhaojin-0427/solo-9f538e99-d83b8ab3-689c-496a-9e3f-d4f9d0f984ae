@@ -50,6 +50,7 @@ DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/partitions/{partition_id}/download[?snapshot_id=N]` | 下载 CSV；带快照号读固定版本 |
 | `POST` | `/snapshots` | 固定当前全部分区，返回快照号 |
 | `GET`  | `/snapshots` | 列出快照及释放状态 |
+| `GET`  | `/snapshots/{id}/usage` | **快照用量**：逐分区列出固定时 SHA-256、完整发送次数、累计字节、最近完成时间 |
 | `POST` | `/snapshots/{id}/release` | 释放快照，之后拒绝新读取（409） |
 | `POST` | `/gc` | 立即执行一轮回收 |
 | `GET`  | `/gc/status` | 回收队列长度、活动下载数、数据卷文件数 |
@@ -68,9 +69,13 @@ SID=$(curl -s -X POST localhost:8000/snapshots | python3 -c 'import sys,json;pri
 # 作业按快照号读取，期间分区可被替换，但快照内容不变
 curl "localhost:8000/partitions/2026-11-14/download?snapshot_id=$SID" -o job-input.csv
 
-# 作业结束释放，之后拒绝新读取
+# 查看快照用量：每个分区固定时的 SHA-256、完整发送次数、累计字节、最近完成时间
+curl "localhost:8000/snapshots/$SID/usage"
+
+# 作业结束释放，之后拒绝新读取（历史用量仍可查）
 curl -X POST localhost:8000/snapshots/$SID/release
 curl -o /dev/null -w "%{http_code}\n" "localhost:8000/partitions/2026-11-14/download?snapshot_id=$SID"  # 409
+curl "localhost:8000/snapshots/$SID/usage"
 
 curl -X POST localhost:8000/gc          # 触发回收
 curl localhost:8000/gc/status
@@ -94,6 +99,11 @@ curl localhost:8000/gc/status
 - `snapshots` / `snapshot_entries`：快照固定的（分区 → blob）映射，
   `released_at` 非空表示已释放；
 - `download_leases`：进行中的下载租约（blob 级），带过期时间；
+- `snapshot_usage`：**快照用量账本**，主键 `(snapshot_id, partition_id)`，
+  记录固定时的 `blob_sha`、`size_bytes`、`completed_downloads`（完整发送
+  次数）、`total_bytes`（累计字节）、`last_completed_at`。建快照时即为每个
+  分区写入零值行（从未下载者也列出）；只对 `snapshots` 建外键，不引用
+  `blobs`/`snapshot_entries`，因此快照释放、条目清理、原件回收都不影响历史；
 - `gc_queue`：待回收 blob 队列，记录尝试次数与最近错误，崩溃后可继续。
 
 一个 blob 只要被以下任一位置引用就**不可回收**：
@@ -150,6 +160,49 @@ blob。流式响应用 **async 生成器**实现（阻塞读放进 anyio 工作�
 blob 被回收后若再次上传相同字节，会重新走「临时文件 → 原子发布」流程，
 得到同一路径并正常下载；上传时若发现该 SHA 已在回收队列，会自动撤销回收。
 
+### 5.7 快照用量记账（`GET /snapshots/{id}/usage`）
+
+响应示例：
+
+```json
+{
+  "snapshot_id": 3,
+  "created_at": "2026-11-16T10:00:00+00:00",
+  "released_at": null,
+  "partition_count": 2,
+  "partitions": [
+    {"partition_id": "2026-11-14", "sha256": "c0e5…", "size_bytes": 28,
+     "completed_downloads": 2, "total_bytes": 56,
+     "last_completed_at": "2026-11-16T10:01:02.123456+00:00", "blob_retained": true},
+    {"partition_id": "2026-11-15", "sha256": "02d9…", "size_bytes": 20,
+     "completed_downloads": 0, "total_bytes": 0,
+     "last_completed_at": null, "blob_retained": false}
+  ]
+}
+```
+
+语义：
+
+- **按（快照, 分区）逐条列出**：`sha256` 是快照固定时的值，之后替换分区或
+  释放快照都不会改写；从未下载的分区也列出（次数/字节为 0、时间为 `null`）。
+- **只统计带 `snapshot_id` 的下载**，普通当前分区下载不记快照用量。
+- **完整发送才计一次**：下载受理时冻结票据（SHA、字节数、租约），文件流
+  读到 EOF 且所有块都已交给 ASGI 服务器后才在**单个 `BEGIN IMMEDIATE`
+  事务**里执行一条原子 `UPDATE ... + 1`。首块前断开或中途断开时生成器在
+  `yield` 处被关闭，不会走到记账语句；异常退出同样不入账。
+- **并发下载分别计数**：每笔下载独立票据与独立事务，互不覆盖。
+- **释放前受理的下载仍入账**：票据在受理时冻结，快照释放后不再接受**新**
+  读取，但已受理的仍在读下载正常读完仍累加；随后原件被回收也不影响。
+- **历史长期可查**：账本行独立于 `snapshot_entries`/`blobs`，释放与回收
+  只让 `blob_retained` 变为 `false`，计数与字节原样保留。
+- **写账失败不留半笔**：计数、字节、时间在同一条 SQL 中更新，失败整体
+  回滚；入账在流末尾的工作线程里执行，失败只记日志，不影响已经发完的响应。
+- **重启只保留已提交统计**：未完成的下载随进程消失，租约在启动时清空，
+  不补记任何未完成请求；升级前已存在的快照在启动时补建**零值**账本行
+  （幂等），不猜测历史下载次数。
+- **慢下载不阻塞**：入账在流结束后进行且不在事件循环内，仍沿用租约 +
+  短临界区模型，慢下载期间上传/释放/其他文件回收照常完成。
+
 ---
 
 ## 6. 测试
@@ -165,7 +218,11 @@ python -m pytest tests/ -q
   反压期间上传/释放/其他文件回收互不阻塞、同字节并发上传去重、并发读写
   快照始终可读、释放后 409；
 - `tests/test_recovery.py`：写盘失败不改原分区、重启继续回收且引用完好、
-  磁盘孤儿文件对账、WAL/外键开关验证。
+  磁盘孤儿文件对账、WAL/外键开关验证；
+- `tests/test_usage.py`：快照用量账本——未下载分区也列出、逐分区累计、
+  释放/回收后仍可查、中途与首块前断开不计、并发分别计数、释放前受理的
+  下载读完仍入账、写账失败无半笔且不影响响应、重启只保留已提交统计、
+  旧库补建零值账本行。
 
 ---
 

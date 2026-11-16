@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import math
 import sqlite3
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, Dict, List, Optional, Sequence
@@ -25,6 +27,8 @@ import anyio
 from . import storage
 from .config import Settings, settings as default_settings
 from .db import connect, metadata_lock, transaction
+
+logger = logging.getLogger(__name__)
 
 
 class ServiceError(Exception):
@@ -53,6 +57,30 @@ def _utcnow() -> datetime:
 
 def _iso(ts: datetime) -> str:
     return ts.isoformat(timespec="seconds")
+
+
+def _iso_us(ts: datetime) -> str:
+    """微秒级时间戳，用于用量账本的“最近完成时间”。"""
+    return ts.isoformat(timespec="microseconds")
+
+
+@dataclass(frozen=True)
+class DownloadTicket:
+    """一次已受理下载的记账票据。
+
+    ``sha``/``size`` 在受理时从数据库与数据卷读到并冻结，之后的分区替换或
+    文件回收都不影响本次下载的计量：即使快照已释放、原件已被回收，只要这次
+    受理的下载最终读完，仍按受理时固定的字节数入账一次。
+    ``snapshot_id`` 为 ``None`` 表示普通（当前分区）下载，不记快照用量。
+    ``path`` 同样是受理时解析出的数据卷路径，流式读取不再查库。
+    """
+
+    snapshot_id: Optional[int]
+    partition_id: str
+    sha: str
+    size: int
+    path: Path
+    lease_id: str
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +297,8 @@ class MoistureService:
                                 for i, r in enumerate(rows)
                             ],
                         )
+                        # 注：快照用量账本按（快照, 分区）冻结 SHA-256，不随
+                        # 分区后续替换而改写，因此这里无需触碰 snapshot_usage。
                         orphaned: List[str] = []
                         if old is not None and old["current_blob"]:
                             old_sha = old["current_blob"]
@@ -306,6 +336,18 @@ class MoistureService:
                         SELECT ?, partition_id, current_blob, row_count
                           FROM partitions
                          WHERE current_blob IS NOT NULL
+                        """,
+                        (snapshot_id,),
+                    )
+                    # 为本次固定的每个分区建立用量账本行（含从未下载者也列出）
+                    conn.execute(
+                        """
+                        INSERT INTO snapshot_usage(snapshot_id, partition_id, blob_sha,
+                                                   size_bytes, completed_downloads, total_bytes)
+                        SELECT ?, p.partition_id, p.current_blob, COALESCE(b.size, 0), 0, 0
+                          FROM partitions p
+                          LEFT JOIN blobs b ON b.sha256 = p.current_blob
+                         WHERE p.current_blob IS NOT NULL
                         """,
                         (snapshot_id,),
                     )
@@ -423,28 +465,141 @@ class MoistureService:
 
     def open_partition_download(
         self, partition_id: str, snapshot_id: Optional[int] = None
-    ):
-        """返回 (sha, 文件路径, 关闭回调)。
+    ) -> DownloadTicket:
+        """受理一次下载：解析固定版本、取得租约并冻结计量票据。
 
         租约在打开文件前取得：回收临界区会跳过带租约的 blob，因此已开始
         的下载一定能完整结束。流式读取期间不持有 metadata_lock。
-        调用方负责在流式响应结束（含客户端断开）时执行关闭回调释放租约。
+        票据里的 sha/字节数在受理时固定，调用方在流正常读完时把它交给
+        :meth:`record_completed_download` 入账。
         """
         with metadata_lock:
             conn = self._conn()
             try:
                 sha = self._resolve_partition_blob(conn, partition_id, snapshot_id)
                 path = storage.blob_path(sha, self.cfg)
-                if not path.exists():
-                    raise MissingBlobFile(f"blob {sha} 的数据卷文件缺失")
+                try:
+                    size = path.stat().st_size
+                except FileNotFoundError:
+                    raise MissingBlobFile(f"blob {sha} 的数据卷文件缺失") from None
                 lease_id = self._acquire_lease(sha)
             finally:
                 conn.close()
 
-        def cleanup() -> None:
-            self._release_lease(lease_id)
+        return DownloadTicket(
+            snapshot_id=snapshot_id,
+            partition_id=partition_id,
+            sha=sha,
+            size=size,
+            path=path,
+            lease_id=lease_id,
+        )
 
-        return sha, path, cleanup
+    def release_download(self, lease_id: str) -> None:
+        """释放下载租约（响应结束、含客户端中途断开时调用）。"""
+        self._release_lease(lease_id)
+
+    def record_completed_download(self, ticket: DownloadTicket) -> bool:
+        """一次快照下载“正常读到末尾”后入账（单事务、全有或全无）。
+
+        - 仅快照下载入账；普通当前分区下载不记快照用量；
+        - 只有客户端把响应完整读完（服务端把最后一字节交给 ASGI 服务器）
+          才会调用到这里，首块前断开或中途断开都不入账；
+        - 并发下载各自持有票据，以原子 ``UPDATE ... + 1`` 分别累加；
+        - 账本行不依赖 blob 原件与快照条目：快照释放、原件回收后历史仍可查；
+          释放前受理的下载即使随后读完，仍照常累加；
+        - 账本行缺失（不应发生）时补建一行再累加，保证“不丢笔”；
+        - 任何写账失败整体回滚，不留下半笔记录；错误由调用方记录日志。
+        """
+        if ticket.snapshot_id is None:
+            return False
+        now = _iso_us(_utcnow())
+        with metadata_lock:
+            conn = self._conn()
+            try:
+                with transaction(conn):
+                    cur = conn.execute(
+                        """
+                        UPDATE snapshot_usage
+                           SET completed_downloads = completed_downloads + 1,
+                               total_bytes = total_bytes + ?,
+                               last_completed_at = ?
+                         WHERE snapshot_id = ? AND partition_id = ?
+                        """,
+                        (ticket.size, now, ticket.snapshot_id, ticket.partition_id),
+                    )
+                    if cur.rowcount == 0:
+                        # 防御性补行：账本行应在建快照时写入
+                        conn.execute(
+                            """
+                            INSERT INTO snapshot_usage(snapshot_id, partition_id, blob_sha,
+                                                       size_bytes, completed_downloads,
+                                                       total_bytes, last_completed_at)
+                            VALUES (?, ?, ?, ?, 1, ?, ?)
+                            """,
+                            (
+                                ticket.snapshot_id,
+                                ticket.partition_id,
+                                ticket.sha,
+                                ticket.size,
+                                ticket.size,
+                                now,
+                            ),
+                        )
+                return True
+            finally:
+                conn.close()
+
+    def get_snapshot_usage(self, snapshot_id: int) -> Dict[str, object]:
+        """逐分区列出快照固定时的 SHA-256、完整发送次数、累计字节与最近完成时间。
+
+        包含从未下载的分区（计数 0、字节 0、时间为 null）。数据来自长期账本，
+        快照释放及原件回收后仍可查询。
+        """
+        conn = self._conn()
+        try:
+            snap = conn.execute(
+                "SELECT snapshot_id, created_at, released_at FROM snapshots"
+                " WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+            if snap is None:
+                raise NotFound(f"快照 {snapshot_id} 不存在")
+            rows = conn.execute(
+                """
+                SELECT u.partition_id, u.blob_sha AS sha256,
+                       u.size_bytes,
+                       u.completed_downloads, u.total_bytes, u.last_completed_at,
+                       EXISTS(SELECT 1 FROM blobs b WHERE b.sha256 = u.blob_sha)
+                           AS blob_retained
+                  FROM snapshot_usage u
+                 WHERE u.snapshot_id = ?
+                 ORDER BY u.partition_id
+                """,
+                (snapshot_id,),
+            ).fetchall()
+            partitions = [
+                {
+                    "partition_id": r["partition_id"],
+                    "sha256": r["sha256"],
+                    "size_bytes": r["size_bytes"],
+                    "completed_downloads": r["completed_downloads"],
+                    "total_bytes": r["total_bytes"],
+                    "last_completed_at": r["last_completed_at"],
+                    # 原件是否仍在数据卷登记中（回收后仍可查历史用量）
+                    "blob_retained": bool(r["blob_retained"]),
+                }
+                for r in rows
+            ]
+            return {
+                "snapshot_id": snap["snapshot_id"],
+                "created_at": snap["created_at"],
+                "released_at": snap["released_at"],
+                "partition_count": len(partitions),
+                "partitions": partitions,
+            }
+        finally:
+            conn.close()
 
     # -- 当前分区元数据 ---------------------------------------------------- #
     def get_partition(self, partition_id: str) -> Dict[str, object]:
@@ -607,14 +762,36 @@ class MoistureService:
         with self._readers_lock:
             return len(self._active_readers)
 
-    def stream_blob(self, path: Path, cleanup, chunk_size: int = 1024 * 1024):
-        """构造受租约保护的异步文件流。
+    async def _record_usage_safely(self, ticket: DownloadTicket) -> None:
+        """流末尾入账。
+
+        - 放到工作线程执行，避免 SQLite 写入阻塞事件循环；
+        - 用 shield 保护：文件已读到 EOF 且所有块都已交给 ASGI 服务器后，
+          即便客户端恰好在此刻断开（响应任务被取消）也要把这一笔写完；
+        - 失败只记录日志，不向客户端抛出（数据已发完）。
+        """
+        try:
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(self.record_completed_download, ticket)
+        except Exception:  # pragma: no cover - 故障注入测试之外不应触发
+            logger.exception(
+                "记录快照用量失败 snapshot_id=%s partition_id=%s",
+                ticket.snapshot_id,
+                ticket.partition_id,
+            )
+
+    def stream_blob(self, path: Path, ticket: DownloadTicket, chunk_size: int = 1024 * 1024):
+        """构造受租约保护的异步文件流，并在正常读完后记一次用量。
 
         使用 async 生成器而非同步生成器：Starlette 对同步迭代器会用
         ``iterate_in_threadpool`` 临时包装，内层生成器在两次取值之间可能被
         GC，导致 finally 提前释放租约。async 生成器会被响应迭代器强引用
         到流结束；这里再用 ``_active_streams`` 集合保留一份强引用做双保险。
-        阻塞的文件读取放进 anyio 工作线程，不卡住事件循环。
+
+        “完整发送”的判定：只有文件被读到 EOF、且生成器在最后一次 ``yield``
+        之后又向前推进一步（即最后一字节已被 ASGI 服务器接受）才入账。
+        客户端在首块前或中途断开时生成器在 ``yield`` 处被关闭，永远不会走到
+        记账语句；异常退出同样不入账。
         """
         async def generator():
             stream_token = object()
@@ -626,8 +803,10 @@ class MoistureService:
                         if not chunk:
                             break
                         yield chunk
+                # 已读到 EOF 且所有块都已交给 ASGI 服务器：本次下载完成
+                await self._record_usage_safely(ticket)
             finally:
                 self._active_streams.discard(stream_token)
-                cleanup()
+                self.release_download(ticket.lease_id)
 
         return generator()
